@@ -31,6 +31,12 @@ APP_TITLE = "Baby A name picker"
 SURNAME_MARTIN_PROPORTION_DEFAULT = 0.00224  # ≈ 0.224% of Australians have surname Martin
 NORMALIZED_JSON_PATH = Path("/Users/david/Names/normalized_rankings.json")  # kept for local fallback
 LOG_PATH = Path("/Users/david/Names/app.log")
+### Expected births parameters (requested)
+# Annual totals used for scaling
+AUS_TOTAL_BIRTHS = 304_000
+VIC_TOTAL_BIRTHS = 72_906
+USA_TOTAL_BIRTHS = 3_784_000
+INTERNATIONAL_TOTAL_BIRTHS = 4_772_000
 
 # Configure logging (file-based)
 _logger = logging.getLogger("baby_name_picker")
@@ -448,28 +454,68 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
             row["UK"] = region_summaries.get("UK", "-")
             row["USA"] = region_summaries.get("USA", "-")
 
-            # Expected births: prefer most recent Australian (NSW/VIC) count from normalized JSON
-            expected_births = None
-            json_path2 = get_normalized_json_path()
-            mtime2 = json_path2.stat().st_mtime if json_path2.exists() else 0.0
+            # Expected births (Aus) and (International) per user specification
+            expected_aus = 0.0
+            expected_intl = 0.0
             json_path3 = get_normalized_json_path()
             mtime2 = json_path3.stat().st_mtime if json_path3.exists() else 0.0
             name_map = load_normalized_map(mtime2)
+            def _latest_count(items: List[Dict]) -> Optional[int]:
+                if not items:
+                    return None
+                try:
+                    items_sorted = sorted(items, key=lambda x: (x.get("year") or -1), reverse=True)
+                except Exception:
+                    items_sorted = items
+                for it in items_sorted:
+                    cnt = it.get("count")
+                    if cnt is None:
+                        continue
+                    try:
+                        cval = int(cnt)
+                        return cval
+                    except Exception:
+                        try:
+                            cval = int(float(cnt))
+                            return cval
+                        except Exception:
+                            continue
+                return None
+
+            vic_cnt: Optional[int] = None
+            nsw_cnt: Optional[int] = None
+            usa_cnt: Optional[int] = None
             if name_map is not None:
                 region_map = name_map.get(nm.name) or next((name_map[k] for k in name_map.keys() if k.lower() == nm.name.lower()), None)
                 if region_map:
-                    aussie_items: List[Dict] = []
-                    for region in ["NSW", "VIC"]:
-                        aussie_items.extend(region_map.get(region, []))
-                    if aussie_items:
-                        # choose most recent with count
-                        aussie_items.sort(key=lambda x: (x.get("year") or -1), reverse=True)
-                        for it in aussie_items:
-                            cnt = it.get("count")
-                            if isinstance(cnt, int):
-                                expected_births = round(float(cnt) * float(SURNAME_MARTIN_PROPORTION_DEFAULT), 3)
-                                break
-            row["Expected 'X Martin' births/yr"] = expected_births
+                    vic_cnt = _latest_count(region_map.get("VIC", []))
+                    nsw_cnt = _latest_count(region_map.get("NSW", []))
+                    usa_cnt = _latest_count(region_map.get("USA", []))
+
+            # Expected births (Aus)
+            if vic_cnt is not None and VIC_TOTAL_BIRTHS > 0:
+                expected_aus = (float(vic_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+            elif nsw_cnt is not None and VIC_TOTAL_BIRTHS > 0:
+                expected_aus = (float(nsw_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+            elif usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
+                expected_aus = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+            else:
+                expected_aus = 0.0
+
+            # Expected births (International)
+            if usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
+                expected_intl = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(INTERNATIONAL_TOTAL_BIRTHS)
+            else:
+                expected_intl = 0.0
+
+            _logger.debug(
+                f"expected_births name={nm.name} VIC={vic_cnt} NSW={nsw_cnt} USA={usa_cnt} "
+                f"Aus={expected_aus:.3f} Intl={expected_intl:.3f}"
+            )
+
+            # Round to whole births for display
+            row["Expected births (Aus)"] = int(round(expected_aus))
+            row["Expected births (International)"] = int(round(expected_intl))
 
             records.append(row)
 
