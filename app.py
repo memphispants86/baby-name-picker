@@ -138,7 +138,7 @@ def get_engine_and_session() -> Tuple:
         engine = create_engine(
             f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
         )
-    SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+    SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False))
     return engine, SessionLocal
 
 
@@ -321,6 +321,127 @@ def load_normalized_map(mtime: float) -> Optional[Dict[str, Dict[str, List[Dict]
         return None
 
 
+@st.cache_data(show_spinner=False)
+def build_region_summary_map_for_names(names_key: Tuple[str, ...]) -> Dict[str, Dict[str, str]]:
+    # names_key should be a tuple of lowercase names for cacheability
+    if not names_key:
+        return {}
+    try:
+        names_lower = set(names_key)
+        summaries_map: Dict[str, Dict[str, str]] = {}
+        if PARQUET_DIR.exists():
+            initials = sorted({(nm[:1].upper() if nm else "#") for nm in names_lower})
+            dfs: List[pd.DataFrame] = []
+            for ini in initials:
+                part = PARQUET_DIR / f"{ini}.parquet"
+                if part.exists():
+                    try:
+                        df_part = pd.read_parquet(part)
+                        dfs.append(df_part)
+                    except Exception as e:
+                        _logger.exception(f"failed reading parquet part {part}: {e}")
+            if dfs:
+                df_all = pd.concat(dfs, ignore_index=True)
+                if not df_all.empty and {"name", "region"}.issubset(set(df_all.columns)):
+                    df_all["__name_lower"] = df_all["name"].astype(str).str.lower()
+                    df_all = df_all[df_all["__name_lower"].isin(names_lower)]
+                    if not df_all.empty:
+                        df_all["__year"] = df_all["year"].fillna(-1)
+                        df_all = df_all.sort_values(by=["__name_lower", "region", "__year"], ascending=[True, True, False])
+                        for (nm_lower, region), grp in df_all.groupby(["__name_lower", "region"]):
+                            parts: List[str] = []
+                            for _, r in grp.iterrows():
+                                year = int(r["year"]) if pd.notna(r.get("year")) else None
+                                rank = int(r["rank"]) if pd.notna(r.get("rank")) else None
+                                count = int(r["count"]) if pd.notna(r.get("count")) else None
+                                year_str = str(year) if year is not None else "?"
+                                if rank is not None and count is not None:
+                                    parts.append(f"{year_str}: {rank} ({count})")
+                                elif rank is not None:
+                                    parts.append(f"{year_str}: {rank}")
+                                elif count is not None:
+                                    parts.append(f"{year_str}: - ({count})")
+                                else:
+                                    parts.append(f"{year_str}:")
+                            summaries_map.setdefault(nm_lower, {})[region] = "; ".join(parts)
+        else:
+            # Fallback to JSON map if parquet not available
+            path = get_normalized_json_path()
+            if path.exists():
+                name_map = load_normalized_map(path.stat().st_mtime)
+                if isinstance(name_map, dict):
+                    for nm_lower in names_lower:
+                        # find exact or case-insensitive key
+                        region_map = name_map.get(nm_lower) or next((name_map[k] for k in name_map.keys() if k.lower() == nm_lower), None)
+                        if region_map:
+                            out: Dict[str, str] = {}
+                            for region in ["NSW", "VIC", "UK", "USA"]:
+                                items = region_map.get(region, [])
+                                if not items:
+                                    out[region] = "-"
+                                    continue
+                                parts: List[str] = []
+                                for it in items:
+                                    year = it.get("year")
+                                    rank = it.get("rank")
+                                    count = it.get("count")
+                                    year_str = str(year) if year is not None else "?"
+                                    if rank is not None and count is not None:
+                                        parts.append(f"{year_str}: {rank} ({count})")
+                                    elif rank is not None:
+                                        parts.append(f"{year_str}: {rank}")
+                                    elif count is not None:
+                                        parts.append(f"{year_str}: - ({count})")
+                                    else:
+                                        parts.append(f"{year_str}:")
+                                out[region] = "; ".join(parts)
+                            summaries_map[nm_lower] = out
+        return summaries_map
+    except Exception as e:
+        _logger.exception(f"build_region_summary_map_for_names error: {e}")
+        return {}
+
+
+@st.cache_data(show_spinner=False)
+def load_expected_births_map_for_names(names_key: Tuple[str, ...]) -> Dict[str, Tuple[int, int]]:
+    # names_key should be a tuple of lowercase names
+    if not names_key:
+        return {}
+    try:
+        names_lower = set(names_key)
+        mapping: Dict[str, Tuple[int, int]] = {}
+        if EXPECTED_SINGLE_PARQUET.exists():
+            df = pd.read_parquet(EXPECTED_SINGLE_PARQUET)
+            if not df.empty and "name" in df.columns:
+                df["__name_lower"] = df["name"].astype(str).str.lower()
+                df = df[df["__name_lower"].isin(names_lower)]
+                for _, r in df.iterrows():
+                    exp_aus = int(r.get("expected_aus") or 0)
+                    exp_intl = int(r.get("expected_intl") or 0)
+                    mapping[r["__name_lower"]] = (exp_aus, exp_intl)
+        elif EXPECTED_PARQUET_DIR.exists():
+            initials = sorted({(nm[:1].upper() if nm else "#") for nm in names_lower})
+            for ini in initials:
+                part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
+                if part.exists():
+                    try:
+                        df = pd.read_parquet(part)
+                        if df.empty:
+                            continue
+                        df["__name_lower"] = df["name"].astype(str).str.lower()
+                        sub = df[df["__name_lower"].isin(names_lower)]
+                        for _, r in sub.iterrows():
+                            exp_aus = int(r.get("expected_aus") or 0)
+                            exp_intl = int(r.get("expected_intl") or 0)
+                            mapping[r["__name_lower"]] = (exp_aus, exp_intl)
+                    except Exception as e:
+                        _logger.exception(f"failed reading expected births part {part}: {e}")
+        return mapping
+    except Exception as e:
+        _logger.exception(f"load_expected_births_map_for_names error: {e}")
+        return {}
+
+
 def get_region_summaries_for_name_by_text(session, name_text: str) -> Dict[str, str]:
     # Prefer normalized JSON if present for speed and consistency
     json_path = get_normalized_json_path()
@@ -475,8 +596,13 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
                 _logger.exception(f"zscore_params error spouse={s.name} values={values}")
                 zscore_params[s.name] = (0.0, 1.0)
 
+        # Preload regional summaries and expected births for just the rated names
+        names_lower_key: Tuple[str, ...] = tuple(sorted([nm.name.lower() for nm in filtered_names]))
+        region_summary_map: Dict[str, Dict[str, str]] = build_region_summary_map_for_names(names_lower_key)
+        expected_births_map: Dict[str, Tuple[int, int]] = load_expected_births_map_for_names(names_lower_key)
+
         records: List[Dict] = []
-        for nm in all_names:
+        for nm in filtered_names:
             row: Dict = {"Name": nm.name}
             weighted_values: List[float] = []
             for sp_name in ordered_spouses:
@@ -510,63 +636,46 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
             else:
                 row["Overall score"] = None
 
-            # Region summaries
-            region_summaries = get_region_summaries_for_name_by_text(session, nm.name)
-            row["NSW"] = region_summaries.get("NSW", "-")
-            row["VIC"] = region_summaries.get("VIC", "-")
-            row["UK"] = region_summaries.get("UK", "-")
-            row["USA"] = region_summaries.get("USA", "-")
+            # Region summaries (preloaded)
+            rs = region_summary_map.get(nm.name.lower())
+            row["NSW"] = rs.get("NSW", "-") if rs else "-"
+            row["VIC"] = rs.get("VIC", "-") if rs else "-"
+            row["UK"] = rs.get("UK", "-") if rs else "-"
+            row["USA"] = rs.get("USA", "-") if rs else "-"
 
-            # Expected births (Aus) and (International) per user specification
-            # Prefer precomputed expected births parquet if available
+            # Expected births (Aus) and (International) — use preloaded map, fallback to JSON estimation
             expected_aus = 0.0
             expected_intl = 0.0
-            if EXPECTED_PARQUET_DIR.exists() or EXPECTED_SINGLE_PARQUET.exists():
-                try:
-                    df_exp = None
-                    if EXPECTED_SINGLE_PARQUET.exists():
-                        df_exp = pd.read_parquet(EXPECTED_SINGLE_PARQUET)
-                        # optional: index by lower-cased name for faster lookup
-                        df_exp["__name_lower"] = df_exp["name"].str.lower()
-                        row_exp = df_exp[df_exp["__name_lower"] == nm.name.lower()].head(1)
-                    else:
-                        ini = (nm.name[:1].upper() if nm.name else "#")
-                        part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
-                        if part.exists():
-                            df_exp = pd.read_parquet(part)
-                            row_exp = df_exp[df_exp["name"].str.lower() == nm.name.lower()].head(1)
-                    if df_exp is not None and row_exp is not None and not row_exp.empty:
-                        expected_aus = float(row_exp.iloc[0]["expected_aus"]) or 0.0
-                        expected_intl = float(row_exp.iloc[0]["expected_intl"]) or 0.0
-                except Exception as e:
-                    _logger.exception(f"expected parquet lookup failed name={nm.name}: {e}")
-            # If not available, compute on the fly as fallback
-            if (expected_aus == 0.0 and expected_intl == 0.0):
+            exp = expected_births_map.get(nm.name.lower())
+            if exp is not None:
+                expected_aus = float(exp[0])
+                expected_intl = float(exp[1])
+            else:
+                # Fallback compute from normalized JSON if parquet not available
                 json_path3 = get_normalized_json_path()
                 mtime2 = json_path3.stat().st_mtime if json_path3.exists() else 0.0
                 name_map = load_normalized_map(mtime2)
-            def _latest_count(items: List[Dict]) -> Optional[int]:
-                if not items:
-                    return None
-                try:
-                    items_sorted = sorted(items, key=lambda x: (x.get("year") or -1), reverse=True)
-                except Exception:
-                    items_sorted = items
-                for it in items_sorted:
-                    cnt = it.get("count")
-                    if cnt is None:
-                        continue
+                def _latest_count(items: List[Dict]) -> Optional[int]:
+                    if not items:
+                        return None
                     try:
-                        cval = int(cnt)
-                        return cval
+                        items_sorted = sorted(items, key=lambda x: (x.get("year") or -1), reverse=True)
                     except Exception:
+                        items_sorted = items
+                    for it in items_sorted:
+                        cnt = it.get("count")
+                        if cnt is None:
+                            continue
                         try:
-                            cval = int(float(cnt))
+                            cval = int(cnt)
                             return cval
                         except Exception:
-                            continue
-                return None
-
+                            try:
+                                cval = int(float(cnt))
+                                return cval
+                            except Exception:
+                                continue
+                    return None
                 vic_cnt: Optional[int] = None
                 nsw_cnt: Optional[int] = None
                 usa_cnt: Optional[int] = None
@@ -576,8 +685,6 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
                         vic_cnt = _latest_count(region_map.get("VIC", []))
                         nsw_cnt = _latest_count(region_map.get("NSW", []))
                         usa_cnt = _latest_count(region_map.get("USA", []))
-
-                # Expected births (Aus)
                 if vic_cnt is not None and VIC_TOTAL_BIRTHS > 0:
                     expected_aus = (float(vic_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
                 elif nsw_cnt is not None and VIC_TOTAL_BIRTHS > 0:
@@ -586,8 +693,6 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
                     expected_aus = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
                 else:
                     expected_aus = 0.0
-
-                # Expected births (International)
                 if usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
                     expected_intl = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(INTERNATIONAL_TOTAL_BIRTHS)
                 else:
@@ -895,30 +1000,40 @@ with tabs[0]:
     # Choose a name
     all_names = fetch_all_names(session)
     ratings_map = fetch_ratings_for_spouse(session, spouse.id)
+    all_name_pairs = [(n.id, n.name) for n in all_names]
 
     # Option to focus on unrated names
     unrated_only = st.checkbox("Show only unrated names", value=True)
     if unrated_only:
-        name_options = [n for n in all_names if n.id not in ratings_map]
+        name_options = [(n.id, n.name) for n in all_names if n.id not in ratings_map]
     else:
-        name_options = all_names
+        name_options = list(all_name_pairs)
 
     next_unrated = get_next_unrated_name(session, spouse.id)
     default_index = 0
-    if next_unrated is not None and next_unrated in name_options:
-        default_index = name_options.index(next_unrated)
+    if next_unrated is not None:
+        try:
+            next_id = next_unrated.id
+            for idx, pair in enumerate(name_options):
+                if pair[0] == next_id:
+                    default_index = idx
+                    break
+        except Exception:
+            pass
 
     if not name_options:
         st.success("No names left to rate in this view.")
     else:
-        selected_name = st.selectbox(
+        selected_pair = st.selectbox(
             "Select a name",
             options=name_options,
             index=default_index,
-            format_func=lambda n: n.name,
+            format_func=lambda t: t[1],
             key=f"select_name_{spouse.id}",
         )
-        existing_rating = ratings_map.get(selected_name.id)
+        selected_name_id = selected_pair[0]
+        selected_name_text = selected_pair[1]
+        existing_rating = ratings_map.get(selected_name_id)
 
         with st.form(key=f"rating_form_{spouse.id}"):
             rating_value = st.slider("Rating", min_value=0, max_value=10, value=int(existing_rating) if existing_rating is not None else 5)
@@ -926,13 +1041,13 @@ with tabs[0]:
             save_clicked = cols[0].form_submit_button("Save")
             clear_clicked = cols[1].form_submit_button("Clear")
             if save_clicked:
-                set_rating(session, selected_name.id, spouse.id, int(rating_value))
-                st.success(f"Saved: {selected_name.name} = {int(rating_value)} for {spouse.name}")
+                set_rating(session, selected_name_id, spouse.id, int(rating_value))
+                st.success(f"Saved: {selected_name_text} = {int(rating_value)} for {spouse.name}")
                 st.session_state["data_version"] += 1
                 st.rerun()
             if clear_clicked:
-                clear_rating(session, selected_name.id, spouse.id)
-                st.info(f"Cleared rating for {selected_name.name} ({spouse.name})")
+                clear_rating(session, selected_name_id, spouse.id)
+                st.info(f"Cleared rating for {selected_name_text} ({spouse.name})")
                 st.session_state["data_version"] += 1
                 st.rerun()
 
@@ -941,26 +1056,29 @@ with tabs[0]:
     if rated_names:
         st.divider()
         st.subheader("Edit existing rating")
-        edit_name = st.selectbox(
+        rated_options = [(n.id, n.name) for n in rated_names]
+        edit_pair = st.selectbox(
             "Select a rated name",
-            options=rated_names,
-            format_func=lambda n: n.name,
+            options=rated_options,
+            format_func=lambda t: t[1],
             key=f"edit_select_name_{spouse.id}",
         )
-        current = ratings_map.get(edit_name.id, 5)
+        edit_name_id = edit_pair[0]
+        edit_name_text = edit_pair[1]
+        current = ratings_map.get(edit_name_id, 5)
         with st.form(key=f"edit_rating_form_{spouse.id}"):
             new_val = st.slider("New rating", min_value=0, max_value=10, value=int(current))
             cols2 = st.columns([1, 1, 4])
             save2 = cols2[0].form_submit_button("Update")
             clear2 = cols2[1].form_submit_button("Clear")
             if save2:
-                set_rating(session, edit_name.id, spouse.id, int(new_val))
-                st.success(f"Updated: {edit_name.name} = {int(new_val)} for {spouse.name}")
+                set_rating(session, edit_name_id, spouse.id, int(new_val))
+                st.success(f"Updated: {edit_name_text} = {int(new_val)} for {spouse.name}")
                 st.session_state["data_version"] += 1
                 st.rerun()
             if clear2:
-                clear_rating(session, edit_name.id, spouse.id)
-                st.info(f"Cleared rating for {edit_name.name} ({spouse.name})")
+                clear_rating(session, edit_name_id, spouse.id)
+                st.info(f"Cleared rating for {edit_name_text} ({spouse.name})")
                 st.session_state["data_version"] += 1
                 st.rerun()
 
