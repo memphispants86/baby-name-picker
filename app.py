@@ -517,6 +517,11 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
             row["Expected births (Aus)"] = int(round(expected_aus))
             row["Expected births (International)"] = int(round(expected_intl))
 
+            # Martin surname expectation (≈0.224%)
+            martin_factor = float(SURNAME_MARTIN_PROPORTION_DEFAULT)
+            row["Expected Martin births (Aus)"] = int(round(expected_aus * martin_factor))
+            row["Expected Martin births (International)"] = int(round(expected_intl * martin_factor))
+
             records.append(row)
 
         df = pd.DataFrame.from_records(records)
