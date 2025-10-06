@@ -8,6 +8,14 @@ import pandas as pd
 ROOT = Path("/Users/david/Names/Baby names")
 OUTPUT_JSON = Path("/Users/david/Names/normalized_rankings.json")
 OUTPUT_PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
+EXPECTED_PARQUET_DIR = Path("/Users/david/Names/expected_births_parquet")
+
+# Totals for expected births calculations
+AUS_TOTAL_BIRTHS = 304_000
+VIC_TOTAL_BIRTHS = 72_906
+USA_TOTAL_BIRTHS = 3_784_000
+INTERNATIONAL_TOTAL_BIRTHS = 4_772_000
+SURNAME_MARTIN_PROPORTION_DEFAULT = 0.00224
 
 
 def normalize_nsw() -> List[Dict]:
@@ -248,6 +256,64 @@ def main():
                 g.drop(columns=["initial"], errors="ignore").to_parquet(outp, index=False)
                 written_files += 1
             print(f"Wrote Parquet partitions to {OUTPUT_PARQUET_DIR} ({written_files} files)")
+
+            # Expected births per name (aggregated)
+            # Latest counts by region per name
+            def latest_counts_by_region(region: str) -> pd.DataFrame:
+                sub = df[df["region"] == region].copy()
+                if sub.empty:
+                    return pd.DataFrame({"name": [], f"{region.lower()}_count": []})
+                sub["__year"] = sub["year"].fillna(-1)
+                sub = sub.sort_values(by=["name", "__year"], ascending=[True, False])
+                sub = sub.drop_duplicates(subset=["name"], keep="first")
+                sub = sub[["name", "count"]]
+                sub = sub.rename(columns={"count": f"{region.lower()}_count"})
+                return sub
+
+            vic_latest = latest_counts_by_region("VIC")
+            nsw_latest = latest_counts_by_region("NSW")
+            usa_latest = latest_counts_by_region("USA")
+            names_all = pd.DataFrame({"name": df["name"].unique()})
+            agg = names_all.merge(vic_latest, on="name", how="left") \
+                            .merge(nsw_latest, on="name", how="left") \
+                            .merge(usa_latest, on="name", how="left")
+            # Compute expected births
+            def compute_expected(row):
+                vic = row.get("vic_count")
+                nsw = row.get("nsw_count")
+                usa = row.get("usa_count")
+                exp_aus = 0.0
+                if pd.notna(vic):
+                    exp_aus = (float(vic) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                elif pd.notna(nsw):
+                    exp_aus = (float(nsw) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                elif pd.notna(usa):
+                    exp_aus = (float(usa) / float(USA_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                exp_intl = 0.0
+                if pd.notna(usa):
+                    exp_intl = (float(usa) / float(USA_TOTAL_BIRTHS)) * float(INTERNATIONAL_TOTAL_BIRTHS)
+                return pd.Series({
+                    "expected_aus": exp_aus,
+                    "expected_intl": exp_intl,
+                    "expected_martin_aus": exp_aus * SURNAME_MARTIN_PROPORTION_DEFAULT,
+                    "expected_martin_intl": exp_intl * SURNAME_MARTIN_PROPORTION_DEFAULT,
+                })
+
+            exp = agg.apply(compute_expected, axis=1)
+            out = pd.concat([agg[["name"]], exp], axis=1)
+            # Round to integers for storage
+            for c in ["expected_aus", "expected_intl", "expected_martin_aus", "expected_martin_intl"]:
+                out[c] = out[c].round().astype(int)
+
+            # Partition by initial and write
+            out["initial"] = out["name"].astype(str).map(_initial)
+            EXPECTED_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+            written_files2 = 0
+            for ini, g in out.groupby("initial"):
+                part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
+                g.drop(columns=["initial"], errors="ignore").to_parquet(part, index=False)
+                written_files2 += 1
+            print(f"Wrote Expected births partitions to {EXPECTED_PARQUET_DIR} ({written_files2} files)")
     except Exception as e:
         print(f"Warning: failed to write Parquet partitions: {e}")
 

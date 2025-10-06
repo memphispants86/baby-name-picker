@@ -32,6 +32,7 @@ SURNAME_MARTIN_PROPORTION_DEFAULT = 0.00224  # ≈ 0.224% of Australians have su
 NORMALIZED_JSON_PATH = Path("/Users/david/Names/normalized_rankings.json")  # kept for local fallback
 LOG_PATH = Path("/Users/david/Names/app.log")
 PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
+EXPECTED_PARQUET_DIR = Path("/Users/david/Names/expected_births_parquet")
 ### Expected births parameters (requested)
 # Annual totals used for scaling
 AUS_TOTAL_BIRTHS = 304_000
@@ -396,8 +397,15 @@ def get_region_summaries_for_name_by_text(session, name_text: str) -> Dict[str, 
             summaries[region] = "; ".join(parts)
         return summaries
 
-    # Fallback to DB entries if JSON missing
-    rows = session.execute(select(RankingEntry, RankingSource).where(RankingEntry.name_id == name_id).join(RankingSource, RankingEntry.source_id == RankingSource.id)).all()
+    # Fallback to DB entries if JSON/parquet missing
+    name_obj = session.execute(select(Name).where(Name.name == name_text)).scalar_one_or_none()
+    if name_obj is None:
+        return {region: "-" for region in ["NSW", "VIC", "UK", "USA"]}
+    rows = session.execute(
+        select(RankingEntry, RankingSource)
+        .where(RankingEntry.name_id == name_obj.id)
+        .join(RankingSource, RankingEntry.source_id == RankingSource.id)
+    ).all()
     region_to_items: Dict[str, List[Tuple[int, Optional[int], Optional[int]]]] = {}
     for entry, src in rows:
         region = _region_from_source_label(src.source or "") or ""
@@ -509,11 +517,26 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
             row["USA"] = region_summaries.get("USA", "-")
 
             # Expected births (Aus) and (International) per user specification
+            # Prefer precomputed expected births parquet if available
             expected_aus = 0.0
             expected_intl = 0.0
-            json_path3 = get_normalized_json_path()
-            mtime2 = json_path3.stat().st_mtime if json_path3.exists() else 0.0
-            name_map = load_normalized_map(mtime2)
+            if EXPECTED_PARQUET_DIR.exists():
+                try:
+                    ini = (nm.name[:1].upper() if nm.name else "#")
+                    part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
+                    if part.exists():
+                        df_exp = pd.read_parquet(part)
+                        row_exp = df_exp[df_exp["name"].str.lower() == nm.name.lower()].head(1)
+                        if not row_exp.empty:
+                            expected_aus = float(row_exp.iloc[0]["expected_aus"]) or 0.0
+                            expected_intl = float(row_exp.iloc[0]["expected_intl"]) or 0.0
+                except Exception as e:
+                    _logger.exception(f"expected parquet lookup failed name={nm.name}: {e}")
+            # If not available, compute on the fly as fallback
+            if (expected_aus == 0.0 and expected_intl == 0.0):
+                json_path3 = get_normalized_json_path()
+                mtime2 = json_path3.stat().st_mtime if json_path3.exists() else 0.0
+                name_map = load_normalized_map(mtime2)
             def _latest_count(items: List[Dict]) -> Optional[int]:
                 if not items:
                     return None
@@ -536,35 +559,34 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
                             continue
                 return None
 
-            vic_cnt: Optional[int] = None
-            nsw_cnt: Optional[int] = None
-            usa_cnt: Optional[int] = None
-            if name_map is not None:
-                region_map = name_map.get(nm.name) or next((name_map[k] for k in name_map.keys() if k.lower() == nm.name.lower()), None)
-                if region_map:
-                    vic_cnt = _latest_count(region_map.get("VIC", []))
-                    nsw_cnt = _latest_count(region_map.get("NSW", []))
-                    usa_cnt = _latest_count(region_map.get("USA", []))
+                vic_cnt: Optional[int] = None
+                nsw_cnt: Optional[int] = None
+                usa_cnt: Optional[int] = None
+                if name_map is not None:
+                    region_map = name_map.get(nm.name) or next((name_map[k] for k in name_map.keys() if k.lower() == nm.name.lower()), None)
+                    if region_map:
+                        vic_cnt = _latest_count(region_map.get("VIC", []))
+                        nsw_cnt = _latest_count(region_map.get("NSW", []))
+                        usa_cnt = _latest_count(region_map.get("USA", []))
 
-            # Expected births (Aus)
-            if vic_cnt is not None and VIC_TOTAL_BIRTHS > 0:
-                expected_aus = (float(vic_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
-            elif nsw_cnt is not None and VIC_TOTAL_BIRTHS > 0:
-                expected_aus = (float(nsw_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
-            elif usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
-                expected_aus = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
-            else:
-                expected_aus = 0.0
+                # Expected births (Aus)
+                if vic_cnt is not None and VIC_TOTAL_BIRTHS > 0:
+                    expected_aus = (float(vic_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                elif nsw_cnt is not None and VIC_TOTAL_BIRTHS > 0:
+                    expected_aus = (float(nsw_cnt) / float(VIC_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                elif usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
+                    expected_aus = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(AUS_TOTAL_BIRTHS)
+                else:
+                    expected_aus = 0.0
 
-            # Expected births (International)
-            if usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
-                expected_intl = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(INTERNATIONAL_TOTAL_BIRTHS)
-            else:
-                expected_intl = 0.0
+                # Expected births (International)
+                if usa_cnt is not None and USA_TOTAL_BIRTHS > 0:
+                    expected_intl = (float(usa_cnt) / float(USA_TOTAL_BIRTHS)) * float(INTERNATIONAL_TOTAL_BIRTHS)
+                else:
+                    expected_intl = 0.0
 
             _logger.debug(
-                f"expected_births name={nm.name} VIC={vic_cnt} NSW={nsw_cnt} USA={usa_cnt} "
-                f"Aus={expected_aus:.3f} Intl={expected_intl:.3f}"
+                f"expected_births name={nm.name} Aus={expected_aus:.3f} Intl={expected_intl:.3f}"
             )
 
             # Round to whole births for display
