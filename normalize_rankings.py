@@ -9,6 +9,7 @@ ROOT = Path("/Users/david/Names/Baby names")
 OUTPUT_JSON = Path("/Users/david/Names/normalized_rankings.json")
 OUTPUT_PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
 EXPECTED_PARQUET_DIR = Path("/Users/david/Names/expected_births_parquet")
+EXPECTED_SINGLE_PARQUET = Path("/Users/david/Names/expected_births.parquet")
 
 # Totals for expected births calculations
 AUS_TOTAL_BIRTHS = 304_000
@@ -314,6 +315,10 @@ def main():
                 g.drop(columns=["initial"], errors="ignore").to_parquet(part, index=False)
                 written_files2 += 1
             print(f"Wrote Expected births partitions to {EXPECTED_PARQUET_DIR} ({written_files2} files)")
+
+            # Also write a single compact parquet for easy bundling in deployments
+            out.drop(columns=["initial"], errors="ignore").to_parquet(EXPECTED_SINGLE_PARQUET, index=False)
+            print(f"Wrote {EXPECTED_SINGLE_PARQUET} with {len(out)} names")
     except Exception as e:
         print(f"Warning: failed to write Parquet partitions: {e}")
 

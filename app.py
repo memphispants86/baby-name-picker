@@ -33,6 +33,7 @@ NORMALIZED_JSON_PATH = Path("/Users/david/Names/normalized_rankings.json")  # ke
 LOG_PATH = Path("/Users/david/Names/app.log")
 PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
 EXPECTED_PARQUET_DIR = Path("/Users/david/Names/expected_births_parquet")
+EXPECTED_SINGLE_PARQUET = Path("/Users/david/Names/expected_births.parquet")
 ### Expected births parameters (requested)
 # Annual totals used for scaling
 AUS_TOTAL_BIRTHS = 304_000
@@ -520,16 +521,23 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
             # Prefer precomputed expected births parquet if available
             expected_aus = 0.0
             expected_intl = 0.0
-            if EXPECTED_PARQUET_DIR.exists():
+            if EXPECTED_PARQUET_DIR.exists() or EXPECTED_SINGLE_PARQUET.exists():
                 try:
-                    ini = (nm.name[:1].upper() if nm.name else "#")
-                    part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
-                    if part.exists():
-                        df_exp = pd.read_parquet(part)
-                        row_exp = df_exp[df_exp["name"].str.lower() == nm.name.lower()].head(1)
-                        if not row_exp.empty:
-                            expected_aus = float(row_exp.iloc[0]["expected_aus"]) or 0.0
-                            expected_intl = float(row_exp.iloc[0]["expected_intl"]) or 0.0
+                    df_exp = None
+                    if EXPECTED_SINGLE_PARQUET.exists():
+                        df_exp = pd.read_parquet(EXPECTED_SINGLE_PARQUET)
+                        # optional: index by lower-cased name for faster lookup
+                        df_exp["__name_lower"] = df_exp["name"].str.lower()
+                        row_exp = df_exp[df_exp["__name_lower"] == nm.name.lower()].head(1)
+                    else:
+                        ini = (nm.name[:1].upper() if nm.name else "#")
+                        part = EXPECTED_PARQUET_DIR / f"{ini}.parquet"
+                        if part.exists():
+                            df_exp = pd.read_parquet(part)
+                            row_exp = df_exp[df_exp["name"].str.lower() == nm.name.lower()].head(1)
+                    if df_exp is not None and row_exp is not None and not row_exp.empty:
+                        expected_aus = float(row_exp.iloc[0]["expected_aus"]) or 0.0
+                        expected_intl = float(row_exp.iloc[0]["expected_intl"]) or 0.0
                 except Exception as e:
                     _logger.exception(f"expected parquet lookup failed name={nm.name}: {e}")
             # If not available, compute on the fly as fallback
