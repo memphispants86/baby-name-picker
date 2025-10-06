@@ -31,6 +31,7 @@ APP_TITLE = "Baby A name picker"
 SURNAME_MARTIN_PROPORTION_DEFAULT = 0.00224  # ≈ 0.224% of Australians have surname Martin
 NORMALIZED_JSON_PATH = Path("/Users/david/Names/normalized_rankings.json")  # kept for local fallback
 LOG_PATH = Path("/Users/david/Names/app.log")
+PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
 ### Expected births parameters (requested)
 # Annual totals used for scaling
 AUS_TOTAL_BIRTHS = 304_000
@@ -306,6 +307,11 @@ def get_normalized_json_path() -> Path:
 @st.cache_data(show_spinner=False)
 def load_normalized_map(mtime: float) -> Optional[Dict[str, Dict[str, List[Dict]]]]:
     try:
+        # Prefer lazy parquet index if present for memory efficiency
+        if PARQUET_DIR.exists():
+            # Return a lightweight index: available initials
+            initials = sorted([p.stem for p in PARQUET_DIR.glob("*.parquet")])
+            return {"__parquet__": {"initials": initials}}
         path = get_normalized_json_path()
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
@@ -319,6 +325,47 @@ def get_region_summaries_for_name_by_text(session, name_text: str) -> Dict[str, 
     mtime = json_path.stat().st_mtime if json_path.exists() else 0.0
     name_map = load_normalized_map(mtime)
     if name_map is not None:
+        # If using parquet partitions, load only the needed partition
+        if isinstance(name_map, dict) and "__parquet__" in name_map and PARQUET_DIR.exists():
+            try:
+                ini = (name_text[:1].upper() if name_text else "#")
+                part = PARQUET_DIR / f"{ini}.parquet"
+                if part.exists():
+                    df_part = pd.read_parquet(part)
+                    df_part = df_part[df_part["name"].str.lower() == name_text.lower()]
+                    region_map: Dict[str, List[Dict]] = {}
+                    for _, r in df_part.iterrows():
+                        region_map.setdefault(r["region"], []).append({
+                            "year": int(r["year"]) if pd.notna(r["year"]) else None,
+                            "rank": int(r["rank"]) if pd.notna(r["rank"]) else None,
+                            "count": int(r["count"]) if pd.notna(r["count"]) else None,
+                        })
+                    # Build summaries from region_map
+                    summaries: Dict[str, str] = {}
+                    for region in ["NSW", "VIC", "UK", "USA"]:
+                        items = region_map.get(region, [])
+                        if not items:
+                            summaries[region] = "-"
+                            continue
+                        items_sorted = sorted(items, key=lambda x: (x.get("year") or -1), reverse=True)
+                        parts: List[str] = []
+                        for it in items_sorted:
+                            year = it.get("year")
+                            rank = it.get("rank")
+                            count = it.get("count")
+                            year_str = str(year) if year is not None else "?"
+                            if rank is not None and count is not None:
+                                parts.append(f"{year_str}: {rank} ({count})")
+                            elif rank is not None:
+                                parts.append(f"{year_str}: {rank}")
+                            elif count is not None:
+                                parts.append(f"{year_str}: - ({count})")
+                            else:
+                                parts.append(f"{year_str}:")
+                        summaries[region] = "; ".join(parts)
+                    return summaries
+            except Exception as e:
+                _logger.exception(f"parquet lookup failed for name={name_text}: {e}")
         # Look up by exact case first; fallback to case-insensitive match
         region_map = name_map.get(name_text)
         if region_map is None:
@@ -387,10 +434,17 @@ def build_results_dataframe(method: str, data_version: int) -> pd.DataFrame:
     SessionLocal = get_session_factory()
     session = SessionLocal()
     try:
+        # Only compute for names that have at least one rating
         all_names = fetch_all_names(session)
-        _logger.debug(f"names={len(all_names)}")
-
+        ratings_present: Dict[int, bool] = {}
         spouses = session.execute(select(Spouse)).scalars().all()
+        for s in spouses:
+            rmap = fetch_ratings_for_spouse(session, s.id)
+            for nid in rmap.keys():
+                ratings_present[nid] = True
+        filtered_names = [nm for nm in all_names if ratings_present.get(nm.id)]
+        _logger.debug(f"names_total={len(all_names)} names_rated={len(filtered_names)}")
+
         spouse_names = [s.name for s in spouses]
         # Ensure default spouses ordering
         ordered_spouses = [sn for sn in ["Nancy", "David"] if sn in spouse_names] + [sn for sn in spouse_names if sn not in ["Nancy", "David"]]

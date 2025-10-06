@@ -7,6 +7,7 @@ import pandas as pd
 
 ROOT = Path("/Users/david/Names/Baby names")
 OUTPUT_JSON = Path("/Users/david/Names/normalized_rankings.json")
+OUTPUT_PARQUET_DIR = Path("/Users/david/Names/normalized_rankings_parquet")
 
 
 def normalize_nsw() -> List[Dict]:
@@ -229,6 +230,26 @@ def main():
 
     OUTPUT_JSON.write_text(json.dumps(name_map, indent=2))
     print(f"Wrote {OUTPUT_JSON} with {len(name_map)} names")
+
+    # Also write partitioned Parquet for lazy loading in the app
+    try:
+        df = pd.DataFrame(all_records)  # columns: region, name, year, rank, count
+        if not df.empty:
+            def _initial(s: str) -> str:
+                if not s:
+                    return "#"
+                ch = s[0].upper()
+                return ch if ("A" <= ch <= "Z") else "#"
+            df["initial"] = df["name"].astype(str).map(_initial)
+            OUTPUT_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+            written_files = 0
+            for ini, g in df.groupby("initial"):
+                outp = OUTPUT_PARQUET_DIR / f"{ini}.parquet"
+                g.drop(columns=["initial"], errors="ignore").to_parquet(outp, index=False)
+                written_files += 1
+            print(f"Wrote Parquet partitions to {OUTPUT_PARQUET_DIR} ({written_files} files)")
+    except Exception as e:
+        print(f"Warning: failed to write Parquet partitions: {e}")
 
 
 if __name__ == "__main__":
