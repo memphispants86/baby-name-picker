@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: baby-name-picker
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: "8501"
+
